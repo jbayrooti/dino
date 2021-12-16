@@ -327,7 +327,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
-        images = [im.cuda(non_blocking=True) for im in images]
+        images = [im.cuda(non_blocking=True) for im in images] # 10 x 64 x 3 x 32 x 32
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
@@ -412,6 +412,8 @@ class DINOLoss(nn.Module):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
+                # q is torch.Size([64, 65536]) for iq = 0
+                # student_out[1] is torch.Size([64, 65536])
                 loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1

@@ -359,24 +359,29 @@ def train_one_epoch(student, teacher, view, teacher_without_ddp, dino_loss, data
         # move images to gpu
         images = images.cuda()
         # get viewmaker views of images
-        images1 = view(images)
-        images2 = view(images)
+        images_view1 = view(images)
+        images_view2 = view(images)
+        images_list = [images_view1, images_view2] # 2 x 128 x 3 x 32 x 32
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            # TODO: is this the correct application? Need to use images2 as well?
-            teacher_output = teacher(images1[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images1)
+            teacher_output = teacher(images_list[:2])  # only the 2 global views pass through the teacher
+            student_output = student(images_list)
             encoder_loss = dino_loss(student_output, teacher_output, epoch)
 
             embs = student(images)
-            embs1 = student(images1)
-            embs2 = student(images2)
+            embs1 = student(images_view1)
+            embs2 = student(images_view2)
             loss_function = NeuTraLADLoss(embs, embs1, embs2, t=args.t)
             view_loss = loss_function.get_loss()
 
         if not math.isfinite(encoder_loss.item()):
             print("Loss is {}, stopping training".format(encoder_loss.item()), force=True)
             sys.exit(1)
+
+        # viewmaker update
+        view_optimizer.zero_grad()
+        view_loss.backward()
+        view_optimizer.step()
 
         # student update
         encoder_optimizer.zero_grad()
@@ -388,7 +393,7 @@ def train_one_epoch(student, teacher, view, teacher_without_ddp, dino_loss, data
             utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
             encoder_optimizer.step()
         else:
-            fp16_scaler.scale(encoder_loss).backward()
+            fp16_scaler.scale(encoder_loss) #.backward()
             if args.clip_grad:
                 fp16_scaler.unscale_(encoder_optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 param_norms = utils.clip_gradients(student, args.clip_grad)
@@ -396,11 +401,6 @@ def train_one_epoch(student, teacher, view, teacher_without_ddp, dino_loss, data
                                               args.freeze_last_layer)
             fp16_scaler.step(encoder_optimizer)
             fp16_scaler.update()
-        
-        # viewmaker update
-        view_optimizer.zero_grad()
-        view_loss.backward()
-        view_optimizer.step()
 
         # EMA update for the teacher
         with torch.no_grad():
@@ -413,7 +413,7 @@ def train_one_epoch(student, teacher, view, teacher_without_ddp, dino_loss, data
         metric_logger.update(encoder_loss=encoder_loss.item())
         metric_logger.update(lr=encoder_optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=encoder_optimizer.param_groups[0]["weight_decay"])
-        wandb.log({"encoder_loss": encoder_loss.item(), "view_loss": view_loss.item(),"lr": encoder_optimizer.param_groups[0]["lr"], "wd": optimizer.param_groups[0]["weight_decay"], "epoch": epoch, "view_bound_magnitude": args.view_bound_magnitude})
+        wandb.log({"encoder_loss": encoder_loss.item(), "view_loss": view_loss.item(),"lr": encoder_optimizer.param_groups[0]["lr"], "wd": encoder_optimizer.param_groups[0]["weight_decay"], "epoch": epoch, "view_bound_magnitude": args.view_bound_magnitude})
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -456,6 +456,8 @@ class DINOLoss(nn.Module):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
+                # q is torch.Size([128, 65536]) for iq = 0
+                # student_out[1] is torch.Size([26, 65536])
                 loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1
