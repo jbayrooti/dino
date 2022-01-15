@@ -29,13 +29,18 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 
+def makedirs(dir_list):
+    for dir in dir_list:
+        if not os.path.exists(dir):
+            os.makedirs(dir)
 
 def eval_linear(args):
-    utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
     wandb.init(project='dino', entity='vm', name=args.exp_name, sync_tensorboard=True)
+    args.output_dir = args.output_dir + "/" + args.exp_name
+    makedirs([args.output_dir])
 
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
@@ -62,7 +67,6 @@ def eval_linear(args):
 
     linear_classifier = LinearClassifier(embed_dim, num_labels=args.num_labels)
     linear_classifier = linear_classifier.cuda()
-    linear_classifier = nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[args.gpu])
 
     # ============ preparing data ... ============
     val_transform = pth_transforms.Compose([
@@ -101,10 +105,9 @@ def eval_linear(args):
     else:
         user = getpass.getuser()
         dataset_train = datasets.CIFAR10(root = f"/scr/jasmine7/cifar10", transform=train_transform, download=True)
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
-        sampler=sampler,
+        sampler = None,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -131,11 +134,10 @@ def eval_linear(args):
     )
     start_epoch = to_restore["epoch"]
     best_acc = to_restore["best_acc"]
+    val_acc = best_acc
 
     for epoch in range(start_epoch, args.epochs):
-        train_loader.sampler.set_epoch(epoch)
-
-        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens)
+        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens, val_acc)
         scheduler.step()
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
@@ -144,6 +146,7 @@ def eval_linear(args):
             test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
             print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             wandb.log({"val": test_stats['acc1']})
+            val_acc = test_stats['acc1']
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
             log_stats = {**{k: v for k, v in log_stats.items()},
@@ -163,7 +166,7 @@ def eval_linear(args):
                 "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
 
 
-def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
+def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, val_acc):
     linear_classifier.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -202,7 +205,7 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "epoch": epoch})
+    wandb.log({"val": val_acc, "loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "epoch": epoch})
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -229,17 +232,18 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         output = linear_classifier(output)
         loss = nn.CrossEntropyLoss()(output, target)
 
-        if linear_classifier.module.num_labels >= 5:
+        if linear_classifier.num_labels >= 5:
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
         else:
             acc1, = utils.accuracy(output, target, topk=(1,))
 
         batch_size = inp.shape[0]
+        wandb.log({"val": acc1.item()})
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        if linear_classifier.module.num_labels >= 5:
+        if linear_classifier.num_labels >= 5:
             metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-    if linear_classifier.module.num_labels >= 5:
+    if linear_classifier.num_labels >= 5:
         print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
     else:
