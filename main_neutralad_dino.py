@@ -47,7 +47,7 @@ def get_args_parser():
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'], \
+        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] \
                 + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
@@ -91,7 +91,7 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=128, type=int,
+    parser.add_argument('--batch_size_per_gpu', default=64, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=200, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
@@ -154,7 +154,8 @@ def get_args_parser():
 def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
-    wandb.init(project='dino', entity='vm', name=args.exp_name, sync_tensorboard=True)
+    if args.rank == 0:
+        wandb.init(project='dino', entity='vm', name=args.exp_name, sync_tensorboard=True)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
@@ -277,7 +278,8 @@ def train_dino(args):
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,  # linear scaling rule
+        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # for nccl backend
+        # args.lr * (args.batch_size_per_gpu) / 256.,  # linear scaling rule
         args.min_lr,
         args.epochs, len(data_loader),
         warmup_epochs=args.warmup_epochs,
@@ -413,7 +415,8 @@ def train_one_epoch(student, teacher, view, teacher_without_ddp, dino_loss, data
         metric_logger.update(encoder_loss=encoder_loss.item())
         metric_logger.update(lr=encoder_optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=encoder_optimizer.param_groups[0]["weight_decay"])
-        wandb.log({"encoder_loss": encoder_loss.item(), "view_loss": view_loss.item(),"lr": encoder_optimizer.param_groups[0]["lr"], "wd": encoder_optimizer.param_groups[0]["weight_decay"], "epoch": epoch, "view_bound_magnitude": args.view_bound_magnitude})
+        if args.rank == 0:
+            wandb.log({"encoder_loss": encoder_loss.item(), "view_loss": view_loss.item(),"lr": encoder_optimizer.param_groups[0]["lr"], "wd": encoder_optimizer.param_groups[0]["weight_decay"], "epoch": epoch, "view_bound_magnitude": args.view_bound_magnitude})
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -472,7 +475,8 @@ class DINOLoss(nn.Module):
         """
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
         dist.all_reduce(batch_center)
-        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+        batch_center = batch_center / (len(teacher_output) * dist.get_world_size()) # for nccl
+        # batch_center = batch_center / len(teacher_output) # for gloo
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)

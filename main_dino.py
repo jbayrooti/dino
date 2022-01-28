@@ -137,7 +137,8 @@ def get_args_parser():
 def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
-    wandb.init(project='dino', entity='vm', name=args.exp_name, sync_tensorboard=True)
+    if args.rank == 0:
+        wandb.init(project='dino', entity='vm', name=args.exp_name, sync_tensorboard=True)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
@@ -251,7 +252,8 @@ def train_dino(args):
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,  # linear scaling rule
+        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # for nccl backend
+        # args.lr * (args.batch_size_per_gpu) / 256.,  # linear scaling rule
         args.min_lr,
         args.epochs, len(data_loader),
         warmup_epochs=args.warmup_epochs,
@@ -369,7 +371,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-        wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "wd": optimizer.param_groups[0]["weight_decay"], "epoch": epoch})
+        if args.rank == 0:
+            wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "wd": optimizer.param_groups[0]["weight_decay"], "epoch": epoch})
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -428,7 +431,8 @@ class DINOLoss(nn.Module):
         """
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
         dist.all_reduce(batch_center)
-        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+        batch_center = batch_center / (len(teacher_output) * dist.get_world_size()) # for nccl
+        # batch_center = batch_center / len(teacher_output) # for gloo
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)

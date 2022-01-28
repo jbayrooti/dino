@@ -35,6 +35,7 @@ def makedirs(dir_list):
             os.makedirs(dir)
 
 def eval_linear(args):
+    utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
@@ -49,7 +50,7 @@ def eval_linear(args):
         embed_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
     # if the network is a XCiT
     elif "xcit" in args.arch:
-        model = torch.hub.load('facebookresearch/xcit', args.arch, num_classes=0)
+        model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
         embed_dim = model.embed_dim
     # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
@@ -67,6 +68,7 @@ def eval_linear(args):
 
     linear_classifier = LinearClassifier(embed_dim, num_labels=args.num_labels)
     linear_classifier = linear_classifier.cuda()
+    linear_classifier = nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[args.gpu])
 
     # ============ preparing data ... ============
     val_transform = pth_transforms.Compose([
@@ -105,9 +107,10 @@ def eval_linear(args):
     else:
         user = getpass.getuser()
         dataset_train = datasets.CIFAR10(root = f"/scr/jasmine7/cifar10", transform=train_transform, download=True)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
-        sampler = None,
+        sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -137,6 +140,7 @@ def eval_linear(args):
     val_acc = best_acc
 
     for epoch in range(start_epoch, args.epochs):
+        train_loader.sampler.set_epoch(epoch)
         train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens, val_acc)
         scheduler.step()
 
@@ -232,7 +236,7 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         output = linear_classifier(output)
         loss = nn.CrossEntropyLoss()(output, target)
 
-        if linear_classifier.num_labels >= 5:
+        if linear_classifier.module.num_labels >= 5:
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
         else:
             acc1, = utils.accuracy(output, target, topk=(1,))
@@ -241,9 +245,9 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         wandb.log({"val": acc1.item()})
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        if linear_classifier.num_labels >= 5:
+        if linear_classifier.module.num_labels >= 5:
             metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-    if linear_classifier.num_labels >= 5:
+    if linear_classifier.module.num_labels >= 5:
         print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
     else:
