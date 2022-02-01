@@ -81,7 +81,7 @@ def eval_linear(args):
         dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
     else:
         user = getpass.getuser()
-        dataset_val = datasets.CIFAR10(root = f"/scr/jasmine7/cifar10", transform=val_transform, download=True)
+        dataset_val = datasets.CIFAR10(root = f"/data5/jasmine7/cifar10", transform=val_transform, download=True)
 
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
@@ -106,7 +106,7 @@ def eval_linear(args):
         dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
     else:
         user = getpass.getuser()
-        dataset_train = datasets.CIFAR10(root = f"/scr/jasmine7/cifar10", transform=train_transform, download=True)
+        dataset_train = datasets.CIFAR10(root = f"/data5/jasmine7/cifar10", transform=train_transform, download=True)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
