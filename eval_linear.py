@@ -81,7 +81,7 @@ def eval_linear(args):
         dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
     else:
         user = getpass.getuser()
-        dataset_val = datasets.CIFAR10(root = f"/data5/jasmine7/cifar10", transform=val_transform, download=True)
+        dataset_val = datasets.CIFAR10(root = f"/scr/jasmine7/cifar10", transform=val_transform, download=True)
 
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
@@ -106,7 +106,8 @@ def eval_linear(args):
         dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
     else:
         user = getpass.getuser()
-        dataset_train = datasets.CIFAR10(root = f"/data5/jasmine7/cifar10", transform=train_transform, download=True)
+        dataset_train = datasets.CIFAR10(root = f"/scr/jasmine7/cifar10", transform=train_transform, download=True)
+    print(f"Using dataset: {args.dataset}")
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -126,15 +127,15 @@ def eval_linear(args):
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
 
-    # Optionally resume from a checkpoint
+    # # Optionally resume from a checkpoint
     to_restore = {"epoch": 0, "best_acc": 0.}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth.tar"),
-        run_variables=to_restore,
-        state_dict=linear_classifier,
-        optimizer=optimizer,
-        scheduler=scheduler,
-    )
+    # utils.restart_from_checkpoint(
+    #     os.path.join(args.output_dir, "checkpoint.pth.tar"),
+    #     run_variables=to_restore,
+    #     state_dict=linear_classifier,
+    #     optimizer=optimizer,
+    #     scheduler=scheduler,
+    # )
     start_epoch = to_restore["epoch"]
     best_acc = to_restore["best_acc"]
     val_acc = best_acc
@@ -294,7 +295,7 @@ if __name__ == '__main__':
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--dataset', default='cifar10', type=str, help='Please specify the training dataset.')
-    parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
+    parser.add_argument('--data_path', default='/scr/jasmine7/imagenet_raw/', type=str)
     parser.add_argument('--exp_name', default="test", type=str, help='Name for the experiment.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")

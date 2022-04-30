@@ -83,32 +83,7 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_nam
         msg = model.load_state_dict(state_dict, strict=False)
         print('Pretrained weights found at {} and loaded with msg: {}'.format(pretrained_weights, msg))
     else:
-        print("Please use the `--pretrained_weights` argument to indicate the path of the checkpoint to evaluate.")
-        url = None
-        if model_name == "vit_small" and patch_size == 16:
-            url = "dino_deitsmall16_pretrain/dino_deitsmall16_pretrain.pth"
-        elif model_name == "vit_small" and patch_size == 8:
-            url = "dino_deitsmall8_pretrain/dino_deitsmall8_pretrain.pth"
-        elif model_name == "vit_base" and patch_size == 16:
-            url = "dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"
-        elif model_name == "vit_base" and patch_size == 8:
-            url = "dino_vitbase8_pretrain/dino_vitbase8_pretrain.pth"
-        elif model_name == "xcit_small_12_p16":
-            url = "dino_xcit_small_12_p16_pretrain/dino_xcit_small_12_p16_pretrain.pth"
-        elif model_name == "xcit_small_12_p8":
-            url = "dino_xcit_small_12_p8_pretrain/dino_xcit_small_12_p8_pretrain.pth"
-        elif model_name == "xcit_medium_24_p16":
-            url = "dino_xcit_medium_24_p16_pretrain/dino_xcit_medium_24_p16_pretrain.pth"
-        elif model_name == "xcit_medium_24_p8":
-            url = "dino_xcit_medium_24_p8_pretrain/dino_xcit_medium_24_p8_pretrain.pth"
-        elif model_name == "resnet50":
-            url = "dino_resnet50_pretrain/dino_resnet50_pretrain.pth"
-        if url is not None:
-            print("Since no pretrained weights have been provided, we load the reference pretrained DINO weights.")
-            state_dict = torch.hub.load_state_dict_from_url(url="https://dl.fbaipublicfiles.com/dino/" + url)
-            model.load_state_dict(state_dict, strict=True)
-        else:
-            print("There is no reference weights available for this model => We use random weights.")
+        raise RuntimeError("No pretrained weights supplied")
 
 
 def load_pretrained_linear_weights(linear_classifier, model_name, patch_size):
@@ -492,7 +467,7 @@ def init_distributed_mode(args):
         sys.exit(1)
 
     dist.init_process_group(
-        backend="nccl",
+        backend="gloo",
         init_method=args.dist_url,
         world_size=args.world_size,
         rank=args.rank,

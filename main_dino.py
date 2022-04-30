@@ -117,17 +117,21 @@ def get_args_parser():
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
+    parser.add_argument('--global_crops_size', type=float, default=224,
+        help="""Size of the global crops.""")
+    parser.add_argument('--local_crops_size', type=float, default=96,
+        help="""Size of the local crops.""")
 
     # Misc
     parser.add_argument('--dataset', default='cifar10', type=str, choices=['cifar10', 'imagenet'],
         help='Please specify the training dataset.')
-    parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
+    parser.add_argument('--data_path', default='/scr/jasmine7/imagenet_raw/train/', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--exp_name', default="test", type=str, help='Name for the experiment.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=1, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
-    parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument('--num_workers', default=18, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
@@ -149,6 +153,8 @@ def train_dino(args):
             args.global_crops_scale,
             args.local_crops_scale,
             args.local_crops_number,
+            args.global_crops_size,
+            args.local_crops_size
         )
         dataset = datasets.ImageFolder(args.data_path, transform=transform)
     else:
@@ -330,6 +336,22 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images] # 10 x 64 x 3 x 32 x 32
+
+        # log images
+        if args.rank == 0 and it % 1000 == 0:
+            img1_to_log = images[0].permute(0,2,3,1).detach()[0].cpu().numpy()
+            img2_to_log = images[1].permute(0,2,3,1).detach()[0].cpu().numpy()
+            views = np.concatenate((img1_to_log, img2_to_log), axis=1)
+            wandb.log({"examples": wandb.Image(views, caption=f"Epoch: {epoch}, Step {it}")})
+
+            small_crops = []
+            for i in range(args.local_crops_number):
+                small_crop_to_log = images[i + 2].permute(0,2,3,1).detach()[0].cpu().numpy()
+                small_crops.append(small_crop_to_log)
+            small_crops_conc = np.concatenate(tuple(small_crops), axis=1)
+            wandb.log({"small crops": wandb.Image(small_crops_conc, caption=f"Epoch: {epoch}, Step {it}")})
+                 
+
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
@@ -439,7 +461,7 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationImageNetDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, global_crops_size=224, local_crops_size=96):
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
@@ -455,14 +477,14 @@ class DataAugmentationImageNetDINO(object):
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(global_crops_size, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(global_crops_size, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
@@ -471,7 +493,7 @@ class DataAugmentationImageNetDINO(object):
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = transforms.Compose([
-            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(local_crops_size, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,
