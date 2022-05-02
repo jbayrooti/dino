@@ -15,6 +15,8 @@ import os
 import argparse
 import json
 from pathlib import Path
+import getpass
+import wandb
 
 import torch
 from torch import nn
@@ -27,12 +29,19 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 
+def makedirs(dir_list):
+    for dir in dir_list:
+        if not os.path.exists(dir):
+            os.makedirs(dir)
 
 def eval_linear(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
+    wandb.init(project='dino', entity='vm', name=args.exp_name, sync_tensorboard=True)
+    args.output_dir = args.output_dir + "/" + args.exp_name
+    makedirs([args.output_dir])
 
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
@@ -41,7 +50,7 @@ def eval_linear(args):
         embed_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
     # if the network is a XCiT
     elif "xcit" in args.arch:
-        model = torch.hub.load('facebookresearch/xcit', args.arch, num_classes=0)
+        model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
         embed_dim = model.embed_dim
     # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
@@ -68,7 +77,12 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
+    if args.dataset == "imagenet":
+        dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
+    else:
+        user = getpass.getuser()
+        dataset_val = datasets.CIFAR10(root = f"/scr/jasmine7/cifar10", transform=val_transform, download=True)
+
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
@@ -88,7 +102,12 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
+    if args.dataset == "imagenet":
+        dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
+    else:
+        user = getpass.getuser()
+        dataset_train = datasets.CIFAR10(root = f"/scr/jasmine7/cifar10", transform=train_transform, download=True)
+    print(f"Using dataset: {args.dataset}")
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -108,22 +127,22 @@ def eval_linear(args):
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
 
-    # Optionally resume from a checkpoint
+    # # Optionally resume from a checkpoint
     to_restore = {"epoch": 0, "best_acc": 0.}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth.tar"),
-        run_variables=to_restore,
-        state_dict=linear_classifier,
-        optimizer=optimizer,
-        scheduler=scheduler,
-    )
+    # utils.restart_from_checkpoint(
+    #     os.path.join(args.output_dir, "checkpoint.pth.tar"),
+    #     run_variables=to_restore,
+    #     state_dict=linear_classifier,
+    #     optimizer=optimizer,
+    #     scheduler=scheduler,
+    # )
     start_epoch = to_restore["epoch"]
     best_acc = to_restore["best_acc"]
+    val_acc = best_acc
 
     for epoch in range(start_epoch, args.epochs):
         train_loader.sampler.set_epoch(epoch)
-
-        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens)
+        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens, val_acc)
         scheduler.step()
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
@@ -131,6 +150,8 @@ def eval_linear(args):
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
             test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
             print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+            wandb.log({"val": test_stats['acc1']})
+            val_acc = test_stats['acc1']
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
             log_stats = {**{k: v for k, v in log_stats.items()},
@@ -150,7 +171,7 @@ def eval_linear(args):
                 "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
 
 
-def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
+def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, val_acc):
     linear_classifier.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -189,6 +210,7 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+    wandb.log({"val": val_acc, "loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "epoch": epoch})
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -221,6 +243,7 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
             acc1, = utils.accuracy(output, target, topk=(1,))
 
         batch_size = inp.shape[0]
+        wandb.log({"val": acc1.item()})
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         if linear_classifier.module.num_labels >= 5:
@@ -271,7 +294,9 @@ if __name__ == '__main__':
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
-    parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
+    parser.add_argument('--dataset', default='cifar10', type=str, help='Please specify the training dataset.')
+    parser.add_argument('--data_path', default='/scr/jasmine7/imagenet_raw/', type=str)
+    parser.add_argument('--exp_name', default="test", type=str, help='Name for the experiment.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")
     parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
