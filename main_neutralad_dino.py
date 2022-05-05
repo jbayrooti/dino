@@ -131,6 +131,8 @@ def get_args_parser():
         help='Please specify the dimension of noise.')
     parser.add_argument('--view_bound_magnitude', default=0.1, type=float,
         help='Please specify the budget size.')
+    parser.add_argument('--view_use_small_crops', default=True, type=bool,
+        help='Specify whether or not the viewmaker should learn from the small crops.')
     parser.add_argument('--budget_type', default="all", type=str,
         help='Please specify the budget type ("all", "partial", or "none").')
     parser.add_argument('--viewmaker_network', default="basic", type=str,
@@ -252,6 +254,9 @@ def train_dino(args):
     print(f"Student and Teacher are built: they are both {args.arch} network.")
 
     # ============ building viewmaker network ... ============
+    if args.local_crops_number == 0:
+        args.view_use_small_crops = False
+    print("Using multi-crops for viewmaker learning.")
     viewmaker = Img2Img(
         args.filter_size,
         args.noise_dim,
@@ -372,8 +377,9 @@ def train_one_epoch(student, teacher, viewmaker, teacher_without_ddp, dino_loss,
                 param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
-        images = [im.cuda(non_blocking=True) for im in images] # 2 x batch_size x 3 x 96 x 96
-        
+        images = [im.cuda(non_blocking=True) for im in images] # 11 x batch_size x 3 x 96 x 96
+        # last image is small size of the first global crop
+
         # compute encoder loss
         norm_views1 = normalize(viewmaker(images[0]))
         norm_views2 = normalize(viewmaker(images[1]))
@@ -408,24 +414,29 @@ def train_one_epoch(student, teacher, viewmaker, teacher_without_ddp, dino_loss,
         anchor_images = images[0]
         views1 = viewmaker(anchor_images)
         views2 = viewmaker(anchor_images)
-        if args.rank == 0 and 2 * it % 1000 == 0:
+        if args.view_use_small_crops:
+            small_anchor_images = images[-1]
+            small_views = viewmaker(small_anchor_images)
+        if args.rank == 0 and it % 1000 == 0:
             images_to_log = anchor_images.permute(0,2,3,1).detach()[0].cpu().numpy()
             view1_to_log = views1.permute(0,2,3,1).detach()[0].cpu().numpy()
             view2_to_log = views2.permute(0,2,3,1).detach()[0].cpu().numpy()
             views_to_log = np.concatenate((images_to_log, view1_to_log, view1_to_log - images_to_log, view2_to_log, view2_to_log - images_to_log), axis=1)
             wandb.log({"view examples": wandb.Image(views_to_log, caption=f"Epoch: {epoch}, Step {it}")})
 
-            small_views = []
-            for i in range(args.local_crops_number):
-                small_view_to_log = norm_views[i + 2].permute(0,2,3,1).detach()[0].cpu().numpy()
-                small_views.append(small_view_to_log)
-            small_views_conc = np.concatenate(tuple(small_views), axis=1)
-            wandb.log({"small views": wandb.Image(small_views_conc, caption=f"Epoch: {epoch}, Step {it}")})
+            if args.view_use_small_crops:
+                small_images_to_log = small_anchor_images.permute(0,2,3,1).detach()[0].cpu().numpy()
+                small_view_to_log = small_views.permute(0,2,3,1).detach()[0].cpu().numpy()
+                small_views_to_log = np.concatenate((small_images_to_log, small_view_to_log, small_view_to_log - small_images_to_log), axis=1)
+                wandb.log({"small views": wandb.Image(small_views_to_log, caption=f"Epoch: {epoch}, Step {it}")})
 
         embs = student(normalize(anchor_images)) # I think this should not be normalized
         embs1 = student(normalize(views1))
         embs2 = student(normalize(views2))
-        loss_function = NeuTraLADLoss(embs, embs1, embs2, t=args.t)
+        small_embs = None
+        if args.view_use_small_crops:
+            small_embs = student(normalize(small_views))
+        loss_function = NeuTraLADLoss(embs, embs1, embs2, extra_outputs=small_embs, t=args.t)
         viewmaker_loss = loss_function.get_loss()
 
         # compute loss for the vm
@@ -526,11 +537,14 @@ class DINOLoss(nn.Module):
 
 class NeuTraLADLoss(object):
     
-    def __init__(self, outputs_orig, outputs1, outputs2, t=0.07):
+    def __init__(self, outputs_orig, outputs1, outputs2, extra_outputs=None, t=0.07):
         super().__init__()
         self.outputs1 = l2_normalize(outputs1, dim=1)
         self.outputs2 = l2_normalize(outputs2, dim=1)
         self.outputs_orig = l2_normalize(outputs_orig, dim=1)
+        self.extra_outputs = None
+        if extra_outputs is not None:
+            self.extra_outputs = extra_outputs
         self.t = t
 
     def get_loss(self):
@@ -548,20 +562,38 @@ class NeuTraLADLoss(object):
         sim_x2_12_cat = torch.cat([sim_x_x2.unsqueeze(-1), sim_x1_x2.unsqueeze(-1)], dim=-1) # [256, 2]
         sim_x2_12_norm = torch.logsumexp(sim_x2_12_cat, dim=1) # [256]
         
-        loss = -torch.mean((sim_x_x1 - sim_x1_12_norm) + (sim_x_x2 - sim_x2_12_norm))
+        if self.extra_outputs is None:
+            loss = -torch.mean((sim_x_x1 - sim_x1_12_norm) + (sim_x_x2 - sim_x2_12_norm))
+            return loss
+        
+        sim_x_x3 = torch.sum(self.extra_outputs * self.outputs_orig, dim=-1) / self.t # [256]
+        sim_x1_x3 = torch.sum(self.outputs1 * self.extra_outputs, dim=-1) / self.t # [256]
+        sim_x2_x3 = torch.sum(self.outputs2 * self.extra_outputs, dim=-1) / self.t # [256]
+
+        sim_x1_123_cat = torch.cat([sim_x_x1.unsqueeze(-1), sim_x1_x2.unsqueeze(-1), sim_x1_x3.unsqueeze(-1)], dim=-1) # [256, 2]
+        sim_x1_123_norm = torch.logsumexp(sim_x1_123_cat, dim=1) # [256]
+
+        sim_x2_123_cat = torch.cat([sim_x_x2.unsqueeze(-1), sim_x1_x2.unsqueeze(-1), sim_x2_x3.unsqueeze(-1)], dim=-1) # [256, 2]
+        sim_x2_123_norm = torch.logsumexp(sim_x2_123_cat, dim=1) # [256]
+
+        sim_x3_123_cat = torch.cat([sim_x_x3.unsqueeze(-1), sim_x1_x3.unsqueeze(-1), sim_x2_x3.unsqueeze(-1)], dim=-1) # [256, 2]
+        sim_x3_123_norm = torch.logsumexp(sim_x3_123_cat, dim=1) # [256]
+
+        loss = -torch.mean((sim_x_x1 - sim_x1_123_norm) + (sim_x_x2 - sim_x2_123_norm) + (sim_x_x3 - sim_x1_123_norm))
         return loss
 
 class DataAugmentationImageNetDINO(object):
     def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, global_crops_size=224, local_crops_size=96):
-        normalize = transforms.Compose([
+        self.normalize = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
+        self.to_tensor = transforms.Compose([transforms.ToTensor()])
+
         # first global crop
         self.global_transfo1 = transforms.Compose([
             transforms.RandomResizedCrop(global_crops_size, scale=global_crops_scale, interpolation=Image.BICUBIC),
-            transforms.ToTensor(),
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
@@ -575,12 +607,19 @@ class DataAugmentationImageNetDINO(object):
             normalize,
         ])
 
+        self.downsample = transforms.Compose([
+            transforms.Resize(local_crops_size, scale=local_crops_scale, interpolation=Image.BICUBIC),
+            transforms.ToTensor(),
+        ])
+
     def __call__(self, image):
         crops = []
-        crops.append(self.global_transfo1(image))
+        first_global_crop = self.global_transfo1(image)
+        crops.append(self.to_tensor(first_global_crop))
         crops.append(self.global_transfo2(image))
         for _ in range(self.local_crops_number):
             crops.append(self.local_transfo(image))
+        crops.append(self.downsample(first_global_crop))
         return crops
     
 class DataAugmentationCIFAR10DINO(object):
